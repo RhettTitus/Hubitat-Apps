@@ -1,0 +1,351 @@
+/**
+ *  Water the garden
+ *
+ *  Copyright 2019 Mark Hutchings
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ *
+ */
+definition(
+    name: "Water the garden",
+    namespace: "mhutchy",
+    author: "Mark Hutchings",
+    description: "Switch a device on and notify with various triggers / sensors (timed)",
+    category: "Convenience",
+    iconUrl: "http://cdn.device-icons.smartthings.com/Outdoor/outdoor12-icn.png",
+    iconX2Url: "http://cdn.device-icons.smartthings.com/Outdoor/outdoor12-icn@2x.png",
+    iconX3Url: "http://cdn.device-icons.smartthings.com/Outdoor/outdoor12-icn@2x.png")
+
+
+preferences {
+
+    section	("Trigger Inputs"){
+    	input "manualSwitch", "capability.switch", title: "Switch to run sequence manually", multiple: false, required: false
+        input "manualButton", "capability.pushableButton", title: "button to run sequence manually", multiple: false, required: false
+		
+        }
+         
+	section ("Weather information"){
+		input "temperature", "capability.temperatureMeasurement", title: "Local temperature", description: "A temperature measuremet device located outside",multiple: false, require: true
+		input "apiKey", "string", title: "openweathermap API Key", required: true
+		input "city", "string", title: "city", required: true
+		input "country", "string", title: "country", description: "Two letter code eg us, uk, fr etc", required: true
+		
+	}
+    section ("Water Valvle"){
+    	input "sprinkler", "capability.switch", title: "Sprinkler to be operated?", multiple: false, required: true
+        
+        }
+    section ("Automatic watering"){
+    	 
+        input "startTime", "time", title: "if autoschedule required: Start Time", required: false
+        input "duration", "number", title: "How long to water for (auto and manual modes) (s)", required: true
+        }
+	
+        
+	section ("Allow automatic watering if the following conditions are met"){
+        input "maxTemp", "number", title: "Today's temperature was over (C)", required: true
+        input "minTemp", "number", title: "Tomorrow morning's min temperature is over (C)", required: true
+        input "maxRain24", "number", title: "Rain in last 24h is less than (mm)", required: true
+        input "dryDays", "number", title: "How many dry days before watering", required: true
+        input "highTemp", "number", title: "Above this temperature, will water after only 24hrs dry", required: true
+        input "rainForcastAllowed", "number", title: "If forcast rain is less than (mm)", required: true
+      
+	}
+        section ("Notifications"){
+    	input "notification", "bool", title: "Send a push notification to smartphone", multiple: false, required: true
+	 	input "notificationDevice", "capability.notification", title: "Notification Device", multiple: true, required: false
+		input "SMSMessage", "bool", title: "Send an SMS notification", multiple: false, required: true
+        input "SMSNumber", "string", title: "phone number for text message", multiple: true, required: false
+        
+         }
+    section ("App preferences"){
+     	input(name: "detailedLog", type: "bool", title: "Detailed logging", description: "Detailed logging", displayDuringSetup: true, required: true)
+		input(name: "conditionalManual", type: "bool", title: "Manual with weather check", description: "If this is enabled the manual trigger will run the weather check 1st as if it is in auto mode", displayDuringSetup: true, required: true)
+
+     }
+}
+
+def installed() {
+	log.debug "$app.label : Installed with settings: ${settings}"
+    
+	unsubscribe()
+	initialize()
+   
+}
+
+def updated() {
+	log.debug "$app.label : Updated with settings: ${settings}"
+
+	unsubscribe()
+	initialize()
+    
+
+}
+
+def initialize() {
+log.debug "$app.label : Initialised ${settings}"
+    
+
+   	subscribe (manualSwitch, "switch.on", manual) 
+    subscribe (manualButton, "pushed.1", manual) 
+    subscribe (sprinkler, "switch", sendNotification)
+	subscribe (temperature, "temperature", updateTemperatures)
+    if (startTime) {
+   		schedule(startTime, "scheduled")
+        }
+	else {logDebug ("$app.label : No sechedule set for ${sprinkler.displayName}")}
+        
+ }
+
+def manual(evt) {
+	
+	logDebug ("${evt.value} received")
+	if (conditionalManual){
+		scheduled (evt)
+	}
+	else{
+    
+        if (state.command == "on") {
+            	logDebug ("${sprinkler.displayName} Manual switch off")
+                switchOff ()
+                }
+ 
+    	else {
+    		logDebug ("${sprinkler.displayName} Manual run for ${duration}s")
+    		switchOn ()
+    		runIn (duration, switchOff)
+    		}  
+      
+        }
+}
+
+def updateTemperatures (evt) {
+	def today = new Date().format( 'EEEE' )
+	
+	logDebug ("It is $today today, last reading was on $state.readingDay")
+	
+	logDebug ("Temperature changes detected - $evt.value")
+	if ((state.maxTempToday == null) || (state.minTempToday == null) || (state.readingDay != today)){
+		logDebug ("initialising max and min temp to $evt.value")
+		state.maxTempYesterday = state.maxTempToday
+		state.minTempYesterday = state.minTempToday
+		state.maxTempToday = evt.value
+		state.minTempToday = evt.value
+	}
+	if (evt.value > state.maxTempToday) {
+		logDebug ("Setting max temp from $state.maxTempToday to $evt.value")
+		state.maxTempToday = evt.value
+	}
+	if (evt.value < state.minTempToday) {
+		logDebug ("Setting min temp from $state.minTempToday to $evt.value")
+		state.minTempToday = evt.value
+	}
+	state.readingDay = today
+}
+
+
+
+
+def scheduled (evt) {
+	logDebug ("$app.label : scheduled handler called, scheduled ? $scheduled")
+	def sprinklerState = sprinkler.currentValue("switch")
+	
+	
+	logDebug ("Getting Current weather data")		
+	
+	try {
+		httpGet("https://api.openweathermap.org/data/2.5/weather?q=${city},${country}&appid=${apiKey}") { resp ->
+       resp.headers.each {
+         }
+        def theHeaders = resp.getHeaders("Content-Length")
+		weatherNow = resp.data
+    }
+	} catch (e) {
+    	log.error "Error getting current data: $e"
+	}
+	
+
+	logDebug ("Getting weather forcast")		
+	
+
+		
+	try {
+   	 httpGet("https://api.openweathermap.org/data/2.5/forecast?q=${city},${country}&appid=${apiKey}") { forcast ->
+        forcast.headers.each {
+             }
+        // get an array of all headers with the specified key
+        def theHeaders = forcast.getHeaders("Content-Length")
+		weatherForcast = forcast.data  
+    	}
+	} catch (e) {
+    	log.error "Error getting forcast: $e"
+	}
+		//workout forcast max and min
+	def rainAmount = 0
+	def forcastRain = 0
+	def forcastMax = weatherForcast.list[0].main.temp
+	def forcastMin = weatherForcast.list[0].main.temp
+	
+	for (int i = 0; i < 9; i++) {
+		rainI = weatherForcast.list[i].rain
+		tempI = weatherForcast.list[i].main.temp
+
+		if (rainI != null) {
+			rainAmount = (rainI.get("3h"))
+			}
+		if (tempI > forcastMax){
+			forcastMax = tempI}
+		else if (tempI < forcastMin){
+			forcastMin = tempI}
+		
+		forcastRain = forcastRain + rainAmount
+	}
+	
+	forcastMax -= 273.15
+	forcastMin -= 273.15
+	
+	def maxToday = weatherNow.main.temp_max - 273.15
+	def minToday = weatherNow.main.temp_min - 273.15
+
+ 	def Rain24H = "$forcastRain"
+    
+    def Rain1H = weatherForcast.list[0].rain
+	logDebug "rain 1h ${Rain1H}"
+	if (weatherForcast.list[0].rain != null){
+		logDebug "rain 1h ${Rain1H.get("3h")}"
+		Rain1H = Rain1H.get("3h")
+	}
+	else{
+		rain1H = 0
+	}
+	
+
+	
+       
+    
+	logDebug ("Forcast minimum next 24h : ${forcastMin}C")
+    
+    
+    def temperatureOK = ((state.maxTempToday as float) >= (maxTemp as float))
+    logDebug ("Max temperature today of ${state.maxTempToday}C, ok for watering (>= ${maxTemp}C)? $temperatureOK")
+    
+    def veryHot = (state.maxTempToday >= highTemp)
+    
+    def aboveFreezing = (forcastMin >= minTemp)
+    logDebug ("Minimum temperature 24h of ${forcastMin}C forcast, Ok for watering (>= ${minTemp}C)? $aboveFreezing")    
+	
+    def rain24HourOK = (state.todaysRain <= maxRain24)
+	logDebug ("${state.todaysRain}mm rain has fallen in last 24h, Ok for watering ( <= ${maxRain24}mm)? $rain24HourOK")
+    
+    def rainingNow = (Rain1H >= 0)
+    logDebug ("Is it raining now? ($Rain1H >= 0) ${rainingNow}")
+    
+    if (!state.noDryDays) {state.noDryDays = 0}
+    
+    def today = new Date().format( 'EEEE' )
+        
+    logDebug ("Today is $today, last checked for dry day on $state.checkedDry")
+    
+	if (state.checkedDry != today) {
+    	if (rain24HourOK) {
+    		state.noDryDays = state.noDryDays + 1
+        	}
+        
+   	 	else (!rain24HourOK) {
+    		state.noDryDays = 0
+        }
+		state.todaysRain = forcastRain
+	}
+		
+        
+    state.checkedDry = today
+    
+    logDebug ("There have been $state.noDryDays dry days")
+    def enoughDryDays = (state.noDryDays >= dryDays)
+    
+    // check to see if it will rain tonight or tomorrow during the day
+
+    
+    def lowRainForcast = (forcastRain < rainForcastAllowed)
+    logDebug ("Forcast rain is $forcastRain : (< $rainForcastAllowed ? $lowRainForcast)")
+
+    logDebug ("ok for watering? scheduled ($scheduled) && temperatureOK ($temperatureOK) && rain24HourOK ($rain24HourOK) && !(rainingNow) ($rainingNow) && aboveFreezing ($aboveFreezing) && (enoughDryDays ($enoughDryDays) || veryHot ($veryHot)) && (lowRainForcast ($lowRainForcast))")
+    
+    def okForAuto = (scheduled && temperatureOK && rain24HourOK && !(rainingNow) && aboveFreezing && (enoughDryDays || veryHot) && lowRainForcast)
+    
+    logDebug ("All conditions met for auto watering? $okForAuto")
+    
+    if (okForAuto){
+    	if (sprinklerState == "on") { logDebug ("${sprinkler.displayName} already on - no action")
+        	
+        }
+        
+        
+ 
+    	if (sprinklerState == "off") {
+    		logDebug ("${sprinkler.displayName} will run for ${duration}s")
+    		switchOn ()
+    		runIn (duration, switchOff)
+    		}  
+            
+       
+        }
+    }
+
+def switchOn ()  {
+	logDebug ("$app.label : ${sprinkler.displayName} switching on")
+    sprinkler.on ()
+    state.command = "on"
+    runIn (2, sprinklerStatus)
+
+    }
+
+def switchOff ()  {
+	logDebug ("$app.label : ${sprinkler.displayName} switching off")
+    sprinkler.off ()
+    state.command = "off"
+    runIn (2, sprinklerStatus)
+       
+    }
+
+def sendNotification (evt) {
+	
+    logDebug ("$app.label - Notification handler called")
+	if (notification) {
+    	def message = "$app.label : ${sprinkler.displayName} switched ${sprinkler.currentValue("switch")}"
+   		if (notification) {
+    		log.debug "$app.label Push notification : $message}"
+			notificationDevice.deviceNotification(message)
+        	sendPush(message)} 
+    	if (SMSMessage) {
+    		log.debug "$app.label Texting $SMSNumber - $message"
+    		sendSmsMessage("$SMSNumber", message)}
+        }
+        }
+   
+def sprinklerStatus ()  {    
+    logDebug ("${sprinkler.displayName} is now ${sprinkler.currentValue("switch")}")    
+    if (state.command != sprinkler.currentValue("switch")){
+    	log.error "$app.label - ${sprinkler.displayName} did not switch $state.command"
+        if (state.command == "off"){
+        	log.debug "$app.label : ${sprinkler.displayName} sending off command again"
+        	switchOff ()}
+        else {
+        	log.debug "$app.label : ${sprinkler.displayName} sending on command again"
+        	switchOn ()}        
+        }
+    }
+
+def logDebug (text) {
+	if (text){
+    	log.debug "$text"
+        }
+    }
